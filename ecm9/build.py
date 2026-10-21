@@ -1,24 +1,28 @@
 """
 meteokav-ecm9/ecm9/build.py - the data behind meteokav.gr's precipitation map (wxprecip.php), from ECMWF's free 9 km
-open data (2026-10-21, user: "option 1 - 9 km, 3 h steps, zero Open-Meteo calls, the GitHub way").
+open data (2026-10-21, user: "option 1 - 9 km, 3 h steps, zero Open-Meteo calls, the GitHub way"; the same day: "add
+a wind layer in km/h ... animated vectors showing the wind flow, Windy style").
 
 WHY HERE AND NOT ON THE HOST: the 0.1 deg GRIB2 files are CCSDS-packed (template 5.42), which only ECMWF's eccodes
 library decodes - a Python job, so it runs as a GitHub Action (.github/workflows/ecm9.yml) and the host only pulls the
-finished picture (wxprecip/pull.php). Open-Meteo is not used at all.
+finished pictures (wxprecip/pull.php). Open-Meteo is not used at all.
 
 WHAT: for the newest IFS HRES run (00 / 06 / 12 / 18 UTC, all four go to 144 h at 3-hour steps) it downloads ONLY the
-total-precipitation message of each step 0..HORIZON (the step's .index file gives its byte range: ~1.5-2.5 MB of a
-~90 MB file, ~65 MB a run), turns the accumulated metres into 3-hour totals in mm, crops the Greece box at the full
-0.1 deg and writes wxprecip's "data image":
-  out/p<run>.png    NX wide, NY x FRAMES tall; frame k = the rain of the 3 hours ENDING at run + 3k h (frame 0 = 0),
-                    each frame north row first, west to east; pixel = mm x 100 in 16 bits (R = high byte, G = low byte)
+messages it needs of each step 0..HORIZON - total precipitation + the 10 m wind (u, v) - through the step's .index file
+(byte ranges: ~8 MB of a ~90 MB file, ~260 MB a run), crops the Greece box at the full 0.1 deg and writes wxprecip's
+"data images":
+  out/p<run>.png    rain: NX wide, NY x FRAMES tall; frame k = the rain of the 3 hours ENDING at run + 3k h (frame 0 =
+                    0), each frame north row first, west to east; pixel = mm x 100 in 16 bits (R = high, G = low byte)
+  out/w<run>.png    wind: the same layout; frame k = the 10 m wind AT run + 3k h (frame 0 = the analysis); R = u,
+                    G = v (m/s, east / north), each byte = WIND_ZERO + value / WIND_SCALE (+-44 m/s = +-160 km/h in
+                    0.35 m/s steps - plenty for a picture, a quarter of 16 bits' size)
   out/latest.json   the run, the grid, frames + step (= 3: the page shows 3-hour periods only - the open data have
-                    no hourly steps, and splitting them into hours would be an estimate, not model output)
+                    no hourly steps, and splitting them into hours would be an estimate, not model output), wind {}
 
 usage:
   python ecm9/build.py --check --published published.json   stdlib only: is a newer complete run out? (GitHub output)
-  python ecm9/build.py --published published.json --out out  the build (needs requirements.txt)
-  python ecm9/build.py --run 2026102012 --out out             a given run (a local test)
+  python ecm9/build.py --run 2026102012 --out out             build that run (needs requirements.txt)
+  --force (with --check): the newest complete run even if it is published (a format change: rebuild now)
 Data: ECMWF open data, CC BY 4.0 - the page credits ECMWF.
 """
 import argparse, calendar, json, os, sys, time, urllib.error, urllib.request
@@ -34,6 +38,9 @@ STEP = 3                                       # h between the open data's steps
 HORIZON = 96                                   # h of forecast on the map (4 days, as before)
 LOOKBACK = 6                                   # runs looked back for the newest complete one (= 36 h)
 TRIES = 4                                      # attempts per file and mirror (waits 3, 6, 9 s between them)
+PARAMS = ("tp", "10u", "10v")                  # the messages taken from each step
+WIND_SCALE = 0.35                              # m/s per byte step of the wind picture
+WIND_ZERO = 128                                # the byte of 0 m/s
 UA = "MeteokavBot/1.0 (+https://www.meteokav.gr)"
 FILL = 65535
 # ---------------------------------------------------------------------
@@ -90,26 +97,31 @@ def newest(published):
     return None
 
 
-def tp_message(run, step):
-    """the total-precipitation GRIB message of one step (bytes), via the .index byte range"""
+def messages(run, step):
+    """{param: GRIB message bytes} of one step for PARAMS, via the .index byte ranges"""
     idx = fetch(stem(run, step) + ".index")
     if idx is None: raise RuntimeError("no index for +%dh" % step)
-    line = next((json.loads(l) for l in idx.decode().splitlines() if '"param": "tp"' in l), None)
-    if not line: raise RuntimeError("no tp in the index of +%dh" % step)
-    o, n = line["_offset"], line["_length"]
-    msg = fetch(stem(run, step) + ".grib2", (o, o + n - 1))
-    if not msg or len(msg) != n: raise RuntimeError("short tp message at +%dh" % step)
-    return msg
+    lines = {}
+    for l in idx.decode().splitlines():
+        j = json.loads(l)
+        if j.get("param") in PARAMS: lines[j["param"]] = j
+    out = {}
+    for p in PARAMS:
+        if p not in lines: raise RuntimeError("no %s in the index of +%dh" % (p, step))
+        o, n = lines[p]["_offset"], lines[p]["_length"]
+        msg = fetch(stem(run, step) + ".grib2", (o, o + n - 1))
+        if not msg or len(msg) != n: raise RuntimeError("short %s message at +%dh" % (p, step))
+        out[p] = msg
+    return out
 
 
 def build(run, out):
     import numpy as np, eccodes
     from PIL import Image
 
-    lats = lons = None
-    prev, frames, got = None, [], 0
-    for step in range(0, HORIZON + 1, STEP):
-        msg = tp_message(run, step); got += len(msg)
+    cut = {}                                   # the box's rows + columns in the global grid (found once)
+
+    def decode(msg):
         h = eccodes.codes_new_from_message(msg)
         try:
             ni, nj = eccodes.codes_get(h, "Ni"), eccodes.codes_get(h, "Nj")
@@ -119,28 +131,43 @@ def build(run, out):
             v = eccodes.codes_get_values(h).reshape(nj, ni)
         finally:
             eccodes.codes_release(h)
-        if lats is None:                       # the box's rows (north -> south) + columns (west -> east) in this grid
+        if not cut:                            # rows north -> south, columns west -> east
             la = np.round(np.arange(BOX["latN"], BOX["latS"] - 1e-6, -RES), 4)
             lo = np.round(np.arange(BOX["lonW"], BOX["lonE"] + 1e-6, RES), 4)
-            lats, lons = np.rint((la1 - la) / d).astype(int), np.rint(((lo - lo1) % 360) / d).astype(int)
-        cur = v[np.ix_(lats, lons)]            # m accumulated since the run's start
-        frames.append(np.zeros_like(cur) if prev is None else np.clip(cur - prev, 0, None) * 1000.0)
-        prev = cur
+            cut["r"], cut["c"] = np.rint((la1 - la) / d).astype(int), np.rint(((lo - lo1) % 360) / d).astype(int)
+        return v[np.ix_(cut["r"], cut["c"])]
 
-    ny, nx = frames[0].shape
-    q = np.clip(np.rint(np.stack(frames) * 100), 0, FILL - 1).astype(np.uint16).reshape(len(frames) * ny, nx)
-    img = np.zeros((len(frames) * ny, nx, 3), np.uint8)
-    img[..., 0], img[..., 1] = q >> 8, q & 255
+    prev, rain, us, vs, got = None, [], [], [], 0
+    for step in range(0, HORIZON + 1, STEP):
+        m = messages(run, step); got += sum(len(x) for x in m.values())
+        cur = decode(m["tp"])                  # m accumulated since the run's start
+        rain.append(np.zeros_like(cur) if prev is None else np.clip(cur - prev, 0, None) * 1000.0)
+        prev = cur
+        us.append(decode(m["10u"])); vs.append(decode(m["10v"]))
+
+    ny, nx = rain[0].shape
     os.makedirs(out, exist_ok=True)
+    q = np.clip(np.rint(np.stack(rain) * 100), 0, FILL - 1).astype(np.uint16).reshape(len(rain) * ny, nx)
+    img = np.zeros((len(rain) * ny, nx, 3), np.uint8)
+    img[..., 0], img[..., 1] = q >> 8, q & 255
     name = "p%d.png" % run
     Image.fromarray(img, "RGB").save(os.path.join(out, name), optimize=True)
+
+    wb = lambda a: np.clip(np.rint(np.stack(a) / WIND_SCALE + WIND_ZERO), 0, 255).astype(np.uint8).reshape(len(a) * ny, nx)
+    img = np.zeros((len(us) * ny, nx, 3), np.uint8)
+    img[..., 0], img[..., 1] = wb(us), wb(vs)
+    wname = "w%d.png" % run
+    Image.fromarray(img, "RGB").save(os.path.join(out, wname), optimize=True)
+
     meta = dict(model="ecmwf_ifs_open_0p1", run=run, generated=int(time.time()), file=name, nx=nx, ny=ny,
-                frames=len(frames), step=STEP, lonW=BOX["lonW"], latN=BOX["latN"], dx=RES, dy=RES, scale=0.01, fill=FILL,
-                source="ECMWF open data (CC BY 4.0)")
+                frames=len(rain), step=STEP, lonW=BOX["lonW"], latN=BOX["latN"], dx=RES, dy=RES, scale=0.01, fill=FILL,
+                wind=dict(file=wname, scale=WIND_SCALE, zero=WIND_ZERO), source="ECMWF open data (CC BY 4.0)")
     with open(os.path.join(out, "latest.json"), "w") as f: json.dump(meta, f)
-    print("run %s: %d frames of %d x %d, tp %.1f MB, png %.1f KB (max 3 h %.1f mm)" % (
-        time.strftime("%Y-%m-%d %HZ", time.gmtime(run)), len(frames), nx, ny, got / 1e6,
-        os.path.getsize(os.path.join(out, name)) / 1024, float(np.max(frames))))
+    spd = np.hypot(np.stack(us), np.stack(vs)) * 3.6
+    print("run %s: %d frames of %d x %d, %.1f MB fetched; rain png %.1f KB (max 3 h %.1f mm), wind png %.1f KB (max %.0f km/h)" % (
+        time.strftime("%Y-%m-%d %HZ", time.gmtime(run)), len(rain), nx, ny, got / 1e6,
+        os.path.getsize(os.path.join(out, name)) / 1024, float(np.max(rain)),
+        os.path.getsize(os.path.join(out, wname)) / 1024, float(spd.max())))
 
 
 def output(**kv):
@@ -155,12 +182,13 @@ def output(**kv):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--force", action="store_true")
     ap.add_argument("--published", default="")
     ap.add_argument("--run", default="")
     ap.add_argument("--out", default="out")
     a = ap.parse_args()
     pub = 0
-    if a.published and os.path.exists(a.published):
+    if a.published and os.path.exists(a.published) and not a.force:
         try: pub = int(json.load(open(a.published)).get("run", 0))
         except Exception: pub = 0
     if a.run:

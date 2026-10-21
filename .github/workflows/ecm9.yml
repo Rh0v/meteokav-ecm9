@@ -10,7 +10,12 @@ name: ecm9
 on:
   schedule:
     - cron: "12,42 * * * *"      # UTC; runs are out ~2 h after 00/06/12/18 UTC (GitHub may start a few minutes late)
-  workflow_dispatch: {}          # the "Run workflow" button in the Actions tab
+  workflow_dispatch:             # the "Run workflow" button in the Actions tab
+    inputs:
+      force:
+        description: "Rebuild the newest run even if it is published (after a format change)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write                # push the data branch
@@ -31,7 +36,7 @@ jobs:
 
       - name: Newer run out?
         id: check
-        run: python3 ecm9/build.py --check --published published.json
+        run: python3 ecm9/build.py --check --published published.json ${{ inputs.force && '--force' || '' }}
 
       - uses: actions/setup-python@v7
         if: steps.check.outputs.new == 'true'
@@ -53,7 +58,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
           git switch --orphan publish
-          cp out/latest.json out/p*.png .
-          git add latest.json p*.png
+          cp out/latest.json out/p*.png out/w*.png .
+          git add latest.json p*.png w*.png
           git commit -q -m "run ${{ steps.check.outputs.run }}"
           git push -f origin HEAD:data
