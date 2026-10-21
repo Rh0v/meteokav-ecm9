@@ -1,6 +1,9 @@
 # meteokav-ecm9 - ECMWF IFS 9 km open data -> meteokav.gr's precipitation map (ecm9/build.py has the why + the format).
-# Every 30 min a cheap check (stdlib Python, no installs) asks the mirrors whether a newer complete run is out; only then
-# eccodes is installed and the picture built. The result is force-pushed as ONE commit to the "data" branch (no history
+# A cheap check (stdlib Python, no installs) asks the mirrors whether a newer complete run is out; only then eccodes is
+# installed and the pictures built. WHEN (2026-10-21, measured from the files' Last-Modified): ECMWF releases each run's
+# 9 km folder in one go, 2 h after the 0.25 deg open data - 00Z 09:34, 06Z 14:27, 12Z 21:34, 18Z 02:27 UTC. GitHub's
+# every-30-min schedule fired once in 6 h on this new repository, so the checks now aim at those releases (a few
+# minutes after, two retries) plus a slow catch-all every 3 h. The result is force-pushed as ONE commit to the "data" branch (no history
 # piles up); the host pulls it from raw.githubusercontent.com (wxprecip/pull.php). No secrets anywhere: the job uses only
 # the built-in GITHUB_TOKEN to push to its own repository.
 # NOTE: GitHub turns scheduled workflows off after 60 days without repository activity - the data pushes count as
@@ -9,7 +12,16 @@ name: ecm9
 
 on:
   schedule:
-    - cron: "12,42 * * * *"      # UTC; runs are out ~2 h after 00/06/12/18 UTC (GitHub may start a few minutes late)
+    # UTC; GitHub may start a scheduled run several minutes late
+    - cron: "38,53 2 * * *"      # 18Z (out 02:27)
+    - cron: "23 3 * * *"
+    - cron: "44,59 9 * * *"      # 00Z (out 09:34)
+    - cron: "29 10 * * *"
+    - cron: "38,53 14 * * *"     # 06Z (out 14:27)
+    - cron: "23 15 * * *"
+    - cron: "44,59 21 * * *"     # 12Z (out 21:34)
+    - cron: "29 22 * * *"
+    - cron: "7 */3 * * *"        # catch-all (a late release, a missed run)
   workflow_dispatch:             # the "Run workflow" button in the Actions tab
     inputs:
       force:
@@ -58,7 +70,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
           git switch --orphan publish
-          cp out/latest.json out/p*.png out/w*.png out/t*.png .
-          git add latest.json p*.png w*.png t*.png
+          cp out/latest.json out/*.png .
+          git add latest.json *.png
           git commit -q -m "run ${{ steps.check.outputs.run }}"
           git push -f origin HEAD:data
