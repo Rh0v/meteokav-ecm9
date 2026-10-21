@@ -21,10 +21,13 @@ through the step's .index file (byte ranges: ~14 MB of a ~90 MB file, ~450 MB a 
                     16 bits like the rain (R = high, G = low byte), deg C = TEMP_MIN + value x TEMP_SCALE
   out/x<run>.png    the rain's MARKS (2026-10-21, user: "lightning symbols where a thunderstorm is likely, snowflakes
                     where it snows"; the open data carry no lightning density, so ECMWF's own ingredients are used):
-                    the same layout, frame k = the 3 hours ending at run + 3k h; R = thunder level 0 / 1 / 2 (the
-                    period's convective rain cp >= THUNDER[i][0] mm AND the larger CAPE (mucape) of its two ends >=
-                    THUNDER[i][1] J/kg), G = the model's snow share of that rain (snowfall sf / tp, 0..255, only
-                    where tp >= SNOW_MIN_MM - its own phase physics on its own 9 km terrain)
+                    the same layout, frame k = the 3 hours ending at run + 3k h; R = THUNDER STRENGTH 0..255
+                    (marks v2, 2026-10-22, user: "size + opacity by the actual intensity"): 0 = no thunder, else the
+                    period's convective rain cp >= THUNDER_MIN[0] mm AND the larger CAPE (mucape) of its two ends >=
+                    THUNDER_MIN[1] J/kg, and the strength = cp x sqrt(CAPE) (the ingredients of ECMWF's own lightning
+                    scheme) on a log scale from THUNDER_SPAN[0] (= 1) to THUNDER_SPAN[1] (= 255); G = the model's snow
+                    share of that rain (snowfall sf / tp, 0..255, only where tp >= SNOW_MIN_MM - its own phase
+                    physics on its own 9 km terrain)
   out/latest.json   the run, the grid, frames + step (= 3: the page shows 3-hour periods only - the open data have
                     no hourly steps, and splitting them into hours would be an estimate, not model output), wind {},
                     temp {}, marks {}
@@ -49,7 +52,8 @@ HORIZON = 96                                   # h of forecast on the map (4 day
 LOOKBACK = 6                                   # runs looked back for the newest complete one (= 36 h)
 TRIES = 4                                      # attempts per file and mirror (waits 3, 6, 9 s between them)
 PARAMS = ("tp", "10u", "10v", "2t", "cp", "mucape", "sf")   # the messages taken from each step
-THUNDER = ((1.0, 400.0), (3.0, 1000.0))       # level 1, 2: (convective rain mm / 3 h, CAPE J/kg) both reached
+THUNDER_MIN = (1.0, 400.0)                     # thunder at all: convective rain mm / 3 h AND CAPE J/kg both reached
+THUNDER_SPAN = (20.0, 600.0)                   # cp x sqrt(CAPE) of strength 1 (= the minimum) .. 255 (e.g. 15 mm, 1600 J/kg)
 SNOW_MIN_MM = 0.3                              # mm / 3 h: below it no snow share (a trace says nothing)
 WIND_SCALE = 0.35                              # m/s per byte step of the wind picture
 WIND_ZERO = 128                                # the byte of 0 m/s
@@ -165,8 +169,10 @@ def build(run, out):
         lvl = np.zeros(cur.shape, np.uint8); share = np.zeros(cur.shape, np.uint8)
         if pcp is not None:
             cp3, sf3, cmax = np.clip(ccp - pcp, 0, None) * 1000.0, np.clip(csf - psf, 0, None) * 1000.0, np.maximum(cape, pcape)
-            for i, (mm, jkg) in enumerate(THUNDER):
-                lvl[(cp3 >= mm) & (cmax >= jkg)] = i + 1
+            on = (cp3 >= THUNDER_MIN[0]) & (cmax >= THUNDER_MIN[1])
+            idx = cp3[on] * np.sqrt(cmax[on])
+            f = np.log(np.maximum(idx, THUNDER_SPAN[0]) / THUNDER_SPAN[0]) / np.log(THUNDER_SPAN[1] / THUNDER_SPAN[0])
+            lvl[on] = (1 + np.rint(np.clip(f, 0, 1) * 254)).astype(np.uint8)
             wet = tp3 >= SNOW_MIN_MM
             share[wet] = np.rint(np.clip(sf3[wet] / tp3[wet], 0, 1) * 255).astype(np.uint8)
         thunder.append(lvl); snow.append(share)
@@ -200,17 +206,17 @@ def build(run, out):
     meta = dict(model="ecmwf_ifs_open_0p1", run=run, generated=int(time.time()), file=name, nx=nx, ny=ny,
                 frames=len(rain), step=STEP, lonW=BOX["lonW"], latN=BOX["latN"], dx=RES, dy=RES, scale=0.01, fill=FILL,
                 wind=dict(file=wname, scale=WIND_SCALE, zero=WIND_ZERO),
-                temp=dict(file=tname, scale=TEMP_SCALE, offset=TEMP_MIN), marks=dict(file=xname),
+                temp=dict(file=tname, scale=TEMP_SCALE, offset=TEMP_MIN), marks=dict(file=xname, v=2),
                 source="ECMWF open data (CC BY 4.0)")
     with open(os.path.join(out, "latest.json"), "w") as f: json.dump(meta, f)
     spd = np.hypot(np.stack(us), np.stack(vs)) * 3.6
     kb = lambda n: os.path.getsize(os.path.join(out, n)) / 1024
     th, sn = np.stack(thunder), np.stack(snow)
     print("run %s: %d frames of %d x %d, %.1f MB fetched; rain png %.1f KB (max 3 h %.1f mm), wind png %.1f KB (max %.0f km/h), "
-          "temp png %.1f KB (%.1f..%.1f C), marks png %.1f KB (thunder cells L1 %d / L2 %d, snow >= 50 %% cells %d)" % (
+          "temp png %.1f KB (%.1f..%.1f C), marks png %.1f KB (thunder cells %d, strength p50 %d / p90 %d / max %d, snow >= 50 %% cells %d)" % (
           time.strftime("%Y-%m-%d %HZ", time.gmtime(run)), len(rain), nx, ny, got / 1e6, kb(name), float(np.max(rain)),
           kb(wname), float(spd.max()), kb(tname), float(np.min(ts)), float(np.max(ts)), kb(xname),
-          int((th == 1).sum()), int((th == 2).sum()), int((sn >= 128).sum())))
+          int((th > 0).sum()), *(int(np.percentile(th[th > 0], q)) if (th > 0).any() else 0 for q in (50, 90, 100)), int((sn >= 128).sum())))
 
 
 def output(**kv):
