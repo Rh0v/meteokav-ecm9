@@ -58,7 +58,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
           git switch --orphan publish
-          cp out/latest.json out/p*.png out/w*.png .
-          git add latest.json p*.png w*.png
+          cp out/latest.json out/p*.png out/w*.png out/t*.png .
+          git add latest.json p*.png w*.png t*.png
           git commit -q -m "run ${{ steps.check.outputs.run }}"
           git push -f origin HEAD:data

@@ -16,8 +16,11 @@ messages it needs of each step 0..HORIZON - total precipitation + the 10 m wind 
   out/w<run>.png    wind: the same layout; frame k = the 10 m wind AT run + 3k h (frame 0 = the analysis); R = u,
                     G = v (m/s, east / north), each byte = WIND_ZERO + value / WIND_SCALE (+-44 m/s = +-160 km/h in
                     0.35 m/s steps - plenty for a picture, a quarter of 16 bits' size)
+  out/t<run>.png    2 m temperature (2026-10-21, user: "a 2m Temp layer"): the same layout, frame k = AT run + 3k h;
+                    16 bits like the rain (R = high, G = low byte), deg C = TEMP_MIN + value x TEMP_SCALE
   out/latest.json   the run, the grid, frames + step (= 3: the page shows 3-hour periods only - the open data have
-                    no hourly steps, and splitting them into hours would be an estimate, not model output), wind {}
+                    no hourly steps, and splitting them into hours would be an estimate, not model output), wind {},
+                    temp {}
 
 usage:
   python ecm9/build.py --check --published published.json   stdlib only: is a newer complete run out? (GitHub output)
@@ -38,9 +41,11 @@ STEP = 3                                       # h between the open data's steps
 HORIZON = 96                                   # h of forecast on the map (4 days, as before)
 LOOKBACK = 6                                   # runs looked back for the newest complete one (= 36 h)
 TRIES = 4                                      # attempts per file and mirror (waits 3, 6, 9 s between them)
-PARAMS = ("tp", "10u", "10v")                  # the messages taken from each step
+PARAMS = ("tp", "10u", "10v", "2t")           # the messages taken from each step
 WIND_SCALE = 0.35                              # m/s per byte step of the wind picture
 WIND_ZERO = 128                                # the byte of 0 m/s
+TEMP_SCALE = 0.1                               # deg C per step of the 16-bit temperature picture (finer = a bigger PNG)
+TEMP_MIN = -60.0                               # deg C of value 0
 UA = "MeteokavBot/1.0 (+https://www.meteokav.gr)"
 FILL = 65535
 # ---------------------------------------------------------------------
@@ -137,21 +142,27 @@ def build(run, out):
             cut["r"], cut["c"] = np.rint((la1 - la) / d).astype(int), np.rint(((lo - lo1) % 360) / d).astype(int)
         return v[np.ix_(cut["r"], cut["c"])]
 
-    prev, rain, us, vs, got = None, [], [], [], 0
+    prev, rain, us, vs, ts, got = None, [], [], [], [], 0
     for step in range(0, HORIZON + 1, STEP):
         m = messages(run, step); got += sum(len(x) for x in m.values())
         cur = decode(m["tp"])                  # m accumulated since the run's start
         rain.append(np.zeros_like(cur) if prev is None else np.clip(cur - prev, 0, None) * 1000.0)
         prev = cur
-        us.append(decode(m["10u"])); vs.append(decode(m["10v"]))
+        us.append(decode(m["10u"])); vs.append(decode(m["10v"])); ts.append(decode(m["2t"]) - 273.15)
 
     ny, nx = rain[0].shape
     os.makedirs(out, exist_ok=True)
-    q = np.clip(np.rint(np.stack(rain) * 100), 0, FILL - 1).astype(np.uint16).reshape(len(rain) * ny, nx)
-    img = np.zeros((len(rain) * ny, nx, 3), np.uint8)
-    img[..., 0], img[..., 1] = q >> 8, q & 255
+
+    def save16(frames, name):                  # 16 bits per cell: R = high byte, G = low byte
+        q = np.clip(np.rint(np.stack(frames)), 0, FILL - 1).astype(np.uint16).reshape(len(frames) * ny, nx)
+        img = np.zeros((len(frames) * ny, nx, 3), np.uint8)
+        img[..., 0], img[..., 1] = q >> 8, q & 255
+        Image.fromarray(img, "RGB").save(os.path.join(out, name), optimize=True)
+
     name = "p%d.png" % run
-    Image.fromarray(img, "RGB").save(os.path.join(out, name), optimize=True)
+    save16([r * 100 for r in rain], name)
+    tname = "t%d.png" % run
+    save16([(t - TEMP_MIN) / TEMP_SCALE for t in ts], tname)
 
     wb = lambda a: np.clip(np.rint(np.stack(a) / WIND_SCALE + WIND_ZERO), 0, 255).astype(np.uint8).reshape(len(a) * ny, nx)
     img = np.zeros((len(us) * ny, nx, 3), np.uint8)
@@ -161,13 +172,14 @@ def build(run, out):
 
     meta = dict(model="ecmwf_ifs_open_0p1", run=run, generated=int(time.time()), file=name, nx=nx, ny=ny,
                 frames=len(rain), step=STEP, lonW=BOX["lonW"], latN=BOX["latN"], dx=RES, dy=RES, scale=0.01, fill=FILL,
-                wind=dict(file=wname, scale=WIND_SCALE, zero=WIND_ZERO), source="ECMWF open data (CC BY 4.0)")
+                wind=dict(file=wname, scale=WIND_SCALE, zero=WIND_ZERO),
+                temp=dict(file=tname, scale=TEMP_SCALE, offset=TEMP_MIN), source="ECMWF open data (CC BY 4.0)")
     with open(os.path.join(out, "latest.json"), "w") as f: json.dump(meta, f)
     spd = np.hypot(np.stack(us), np.stack(vs)) * 3.6
-    print("run %s: %d frames of %d x %d, %.1f MB fetched; rain png %.1f KB (max 3 h %.1f mm), wind png %.1f KB (max %.0f km/h)" % (
-        time.strftime("%Y-%m-%d %HZ", time.gmtime(run)), len(rain), nx, ny, got / 1e6,
-        os.path.getsize(os.path.join(out, name)) / 1024, float(np.max(rain)),
-        os.path.getsize(os.path.join(out, wname)) / 1024, float(spd.max())))
+    kb = lambda n: os.path.getsize(os.path.join(out, n)) / 1024
+    print("run %s: %d frames of %d x %d, %.1f MB fetched; rain png %.1f KB (max 3 h %.1f mm), wind png %.1f KB (max %.0f km/h), "
+          "temp png %.1f KB (%.1f..%.1f C)" % (time.strftime("%Y-%m-%d %HZ", time.gmtime(run)), len(rain), nx, ny, got / 1e6,
+          kb(name), float(np.max(rain)), kb(wname), float(spd.max()), kb(tname), float(np.min(ts)), float(np.max(ts))))
 
 
 def output(**kv):
