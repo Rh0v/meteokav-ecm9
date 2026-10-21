@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Published run
         run: git fetch --depth=1 origin data:data 2>/dev/null && git show data:latest.json > published.json || echo '{}' > published.json
@@ -33,7 +33,7 @@ jobs:
         id: check
         run: python3 ecm9/build.py --check --published published.json
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: steps.check.outputs.new == 'true'
         with:
           python-version: "3.12"
