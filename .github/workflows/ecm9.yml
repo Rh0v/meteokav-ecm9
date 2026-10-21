@@ -1,0 +1,59 @@
+# meteokav-ecm9 - ECMWF IFS 9 km open data -> meteokav.gr's precipitation map (ecm9/build.py has the why + the format).
+# Every 30 min a cheap check (stdlib Python, no installs) asks the mirrors whether a newer complete run is out; only then
+# eccodes is installed and the picture built. The result is force-pushed as ONE commit to the "data" branch (no history
+# piles up); the host pulls it from raw.githubusercontent.com (wxprecip/pull.php). No secrets anywhere: the job uses only
+# the built-in GITHUB_TOKEN to push to its own repository.
+# NOTE: GitHub turns scheduled workflows off after 60 days without repository activity - the data pushes count as
+# activity; if the map ever stops, check the Actions tab first (re-enable the workflow there).
+name: ecm9
+
+on:
+  schedule:
+    - cron: "12,42 * * * *"      # UTC; runs are out ~2 h after 00/06/12/18 UTC (GitHub may start a few minutes late)
+  workflow_dispatch: {}          # the "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write                # push the data branch
+
+concurrency:
+  group: ecm9
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Published run
+        run: git fetch --depth=1 origin data:data 2>/dev/null && git show data:latest.json > published.json || echo '{}' > published.json
+
+      - name: Newer run out?
+        id: check
+        run: python3 ecm9/build.py --check --published published.json
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.new == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        if: steps.check.outputs.new == 'true'
+        run: pip install -r requirements.txt && python -c "import eccodes; print('eccodes', eccodes.codes_get_api_version())"
+
+      - name: Build
+        if: steps.check.outputs.new == 'true'
+        run: python ecm9/build.py --run ${{ steps.check.outputs.run }} --out out
+
+      - name: Publish to the data branch
+        if: steps.check.outputs.new == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git switch --orphan publish
+          cp out/latest.json out/p*.png .
+          git add latest.json p*.png
+          git commit -q -m "run ${{ steps.check.outputs.run }}"
+          git push -f origin HEAD:data

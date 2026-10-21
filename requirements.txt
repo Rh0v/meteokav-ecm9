@@ -1,0 +1,4 @@
+eccodes==2.50.0
+eccodeslib==2.50.0.33; sys_platform == "linux"
+numpy==2.5.4
+pillow==13.0.0
