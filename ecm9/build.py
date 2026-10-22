@@ -28,6 +28,8 @@ through the step's .index file (byte ranges: ~14 MB of a ~90 MB file, ~450 MB a 
                     scheme) on a log scale from THUNDER_SPAN[0] (= 1) to THUNDER_SPAN[1] (= 255); G = the model's snow
                     share of that rain (snowfall sf / tp, 0..255, only where tp >= SNOW_MIN_MM - its own phase
                     physics on its own 9 km terrain)
+  out/m<run>.png    mean sea level pressure (2026-10-22, user: "an MSLP layer with smooth pressure lines"): the same
+                    layout, frame k = AT run + 3k h; 16 bits, hPa = PRES_MIN + value x PRES_SCALE
   out/latest.json   the run, the grid, frames + step (= 3: the page shows 3-hour periods only - the open data have
                     no hourly steps, and splitting them into hours would be an estimate, not model output), wind {},
                     temp {}, marks {}
@@ -45,13 +47,18 @@ MIRRORS = [                                    # ECMWF's portal, then the AWS co
     "https://data.ecmwf.int/forecasts/",       # (2026-10-21: the AWS copy of the new 0p1 folder answered 503 Slow Down
     "https://ecmwf-forecasts.s3.eu-central-1.amazonaws.com/",   # to every other request; ECMWF limits connections)
 ]
-BOX = dict(lonW=17.5, lonE=31.5, latS=34.6, latN=42.0)   # = wxprecip's grid box (the page's MAX_BOUNDS)
+# the map's box (the page takes it from latest.json). 2026-10-22 (user: "more of the Balkans and a bit more of Italy -
+# organised systems and the winter's cold shots from the north"): south Italy + Sicily to the Black Sea's west coast,
+# Crete to Hungary / Romania (was 17.5-31.5 E, 34.6-42.0 N)
+BOX = dict(lonW=11.0, lonE=33.0, latS=34.0, latN=47.5)
 RES = 0.1                                      # deg: the open data's own grid, nothing resampled
 STEP = 3                                       # h between the open data's steps (to 144 h)
 HORIZON = 96                                   # h of forecast on the map (4 days, as before)
 LOOKBACK = 6                                   # runs looked back for the newest complete one (= 36 h)
 TRIES = 4                                      # attempts per file and mirror (waits 3, 6, 9 s between them)
-PARAMS = ("tp", "10u", "10v", "2t", "cp", "mucape", "sf")   # the messages taken from each step
+PARAMS = ("tp", "10u", "10v", "2t", "cp", "mucape", "sf", "msl")   # the messages taken from each step
+PRES_SCALE = 0.05                              # hPa per step of the 16-bit pressure picture (0.05 = smooth isobars)
+PRES_MIN = 900.0                               # hPa of value 0
 THUNDER_MIN = (1.0, 400.0)                     # thunder at all: convective rain mm / 3 h AND CAPE J/kg both reached
 THUNDER_SPAN = (20.0, 600.0)                   # cp x sqrt(CAPE) of strength 1 (= the minimum) .. 255 (e.g. 15 mm, 1600 J/kg)
 SNOW_MIN_MM = 0.3                              # mm / 3 h: below it no snow share (a trace says nothing)
@@ -155,7 +162,7 @@ def build(run, out):
             cut["r"], cut["c"] = np.rint((la1 - la) / d).astype(int), np.rint(((lo - lo1) % 360) / d).astype(int)
         return v[np.ix_(cut["r"], cut["c"])]
 
-    prev, rain, us, vs, ts, got = None, [], [], [], [], 0
+    prev, rain, us, vs, ts, ps, got = None, [], [], [], [], [], 0
     pcp = psf = pcape = None; thunder, snow = [], []
     for step in range(0, HORIZON + 1, STEP):
         m = messages(run, step); got += sum(len(x) for x in m.values())
@@ -164,6 +171,7 @@ def build(run, out):
         rain.append(tp3)
         prev = cur
         us.append(decode(m["10u"])); vs.append(decode(m["10v"])); ts.append(decode(m["2t"]) - 273.15)
+        ps.append(decode(m["msl"]) / 100.0)    # Pa -> hPa
         # the marks: this period's convective rain + snowfall (accumulated, m) and the larger CAPE of its two ends
         ccp, csf, cape = decode(m["cp"]), decode(m["sf"]), np.nan_to_num(decode(m["mucape"]))
         lvl = np.zeros(cur.shape, np.uint8); share = np.zeros(cur.shape, np.uint8)
@@ -191,6 +199,8 @@ def build(run, out):
     save16([r * 100 for r in rain], name)
     tname = "t%d.png" % run
     save16([(t - TEMP_MIN) / TEMP_SCALE for t in ts], tname)
+    mname = "m%d.png" % run
+    save16([(p - PRES_MIN) / PRES_SCALE for p in ps], mname)
 
     wb = lambda a: np.clip(np.rint(np.stack(a) / WIND_SCALE + WIND_ZERO), 0, 255).astype(np.uint8).reshape(len(a) * ny, nx)
     img = np.zeros((len(us) * ny, nx, 3), np.uint8)
@@ -207,6 +217,7 @@ def build(run, out):
                 frames=len(rain), step=STEP, lonW=BOX["lonW"], latN=BOX["latN"], dx=RES, dy=RES, scale=0.01, fill=FILL,
                 wind=dict(file=wname, scale=WIND_SCALE, zero=WIND_ZERO),
                 temp=dict(file=tname, scale=TEMP_SCALE, offset=TEMP_MIN), marks=dict(file=xname, v=2),
+                pres=dict(file=mname, scale=PRES_SCALE, offset=PRES_MIN),
                 source="ECMWF open data (CC BY 4.0)")
     with open(os.path.join(out, "latest.json"), "w") as f: json.dump(meta, f)
     spd = np.hypot(np.stack(us), np.stack(vs)) * 3.6
@@ -217,6 +228,7 @@ def build(run, out):
           time.strftime("%Y-%m-%d %HZ", time.gmtime(run)), len(rain), nx, ny, got / 1e6, kb(name), float(np.max(rain)),
           kb(wname), float(spd.max()), kb(tname), float(np.min(ts)), float(np.max(ts)), kb(xname),
           int((th > 0).sum()), *(int(np.percentile(th[th > 0], q)) if (th > 0).any() else 0 for q in (50, 90, 100)), int((sn >= 128).sum())))
+    print("pressure png %.1f KB (%.1f..%.1f hPa)" % (kb(mname), float(np.min(ps)), float(np.max(ps))))
 
 
 def output(**kv):
