@@ -59,6 +59,9 @@ TRIES = 4                                      # attempts per file and mirror (w
 PARAMS = ("tp", "10u", "10v", "2t", "cp", "mucape", "sf", "msl")   # the messages taken from each step
 PRES_SCALE = 0.05                              # hPa per step of the 16-bit pressure picture (0.05 = smooth isobars)
 PRES_MIN = 900.0                               # hPa of value 0
+# sea-level pressure over mountains is a reduction, noisy at 9 km (small closed loops over the Dinarides / Balkan Mts):
+# smoothed like on every weather chart - a Gaussian of this many cells (~30 km) before the isobars are drawn
+PRES_SMOOTH = 3.0
 THUNDER_MIN = (1.0, 400.0)                     # thunder at all: convective rain mm / 3 h AND CAPE J/kg both reached
 THUNDER_SPAN = (20.0, 600.0)                   # cp x sqrt(CAPE) of strength 1 (= the minimum) .. 255 (e.g. 15 mm, 1600 J/kg)
 SNOW_MIN_MM = 0.3                              # mm / 3 h: below it no snow share (a trace says nothing)
@@ -199,6 +202,13 @@ def build(run, out):
     save16([r * 100 for r in rain], name)
     tname = "t%d.png" % run
     save16([(t - TEMP_MIN) / TEMP_SCALE for t in ts], tname)
+    def smooth(a, sigma):                      # separable Gaussian, edges padded (no numpy-free scipy needed)
+        r = int(3 * sigma); k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2); k /= k.sum()
+        p = np.pad(a, r, mode="edge")
+        p = np.apply_along_axis(lambda v: np.convolve(v, k, "valid"), 1, p)
+        return np.apply_along_axis(lambda v: np.convolve(v, k, "valid"), 0, p)
+
+    ps = [smooth(p, PRES_SMOOTH) for p in ps]
     mname = "m%d.png" % run
     save16([(p - PRES_MIN) / PRES_SCALE for p in ps], mname)
 
