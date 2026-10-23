@@ -49,8 +49,9 @@ MIRRORS = [                                    # ECMWF's portal, then the AWS co
 ]
 # the map's box (the page takes it from latest.json). 2026-10-22 (user: "more of the Balkans and a bit more of Italy -
 # organised systems and the winter's cold shots from the north"): south Italy + Sicily to the Black Sea's west coast,
-# Crete to Hungary / Romania (was 17.5-31.5 E, 34.6-42.0 N)
-BOX = dict(lonW=11.0, lonE=33.0, latS=34.0, latN=47.5)
+# Crete to Hungary / Romania (was 17.5-31.5 E, 34.6-42.0 N). 2026-10-23 (user: "Greece in the centre of the frame"): the
+# widest view shows the whole box, so its centre sits on Greece - south to the African coast, east to Cyprus
+BOX = dict(lonW=11.0, lonE=35.0, latS=31.5, latN=47.5)
 RES = 0.1                                      # deg: the open data's own grid, nothing resampled
 STEP = 3                                       # h between the open data's steps (to 144 h)
 HORIZON = 96                                   # h of forecast on the map (4 days, as before)
