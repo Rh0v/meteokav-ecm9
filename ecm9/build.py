@@ -57,7 +57,7 @@ HORIZON = 96                                   # h of forecast on the map (4 day
 LOOKBACK = 6                                   # runs looked back for the newest complete one (= 36 h)
 TRIES = 4                                      # attempts per file and mirror (waits 3, 6, 9 s between them)
 PARAMS = ("tp", "10u", "10v", "2t", "cp", "mucape", "sf", "msl")   # the messages taken from each step
-PRES_SCALE = 0.05                              # hPa per step of the 16-bit pressure picture (0.05 = smooth isobars)
+PRES_SCALE = 0.01                              # hPa per step of the 16-bit pressure picture (0.05 left terraces in flat fields: broken isobars)
 PRES_MIN = 900.0                               # hPa of value 0
 # sea-level pressure over mountains is a reduction, noisy at 9 km (small closed loops over the Dinarides / Balkan Mts):
 # smoothed like on every weather chart - a Gaussian of this many cells (~30 km) before the isobars are drawn
