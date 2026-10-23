@@ -54,7 +54,7 @@ MIRRORS = [                                    # ECMWF's portal, then the AWS co
 BOX = dict(lonW=11.0, lonE=35.0, latS=31.5, latN=47.5)
 RES = 0.1                                      # deg: the open data's own grid, nothing resampled
 STEP = 3                                       # h between the open data's steps (to 144 h)
-HORIZON = 96                                   # h of forecast on the map (4 days, as before)
+HORIZON = 144                                  # h of forecast on the map: all of the open data's 3-hour steps (6 days; was 96 until 2026-10-23)
 LOOKBACK = 6                                   # runs looked back for the newest complete one (= 36 h)
 TRIES = 4                                      # attempts per file and mirror (waits 3, 6, 9 s between them)
 PARAMS = ("tp", "10u", "10v", "2t", "cp", "mucape", "sf", "msl")   # the messages taken from each step
