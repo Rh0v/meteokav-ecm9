@@ -30,9 +30,16 @@ through the step's .index file (byte ranges: ~14 MB of a ~90 MB file, ~450 MB a 
                     physics on its own 9 km terrain)
   out/m<run>.png    mean sea level pressure (2026-10-22, user: "an MSLP layer with smooth pressure lines"): the same
                     layout, frame k = AT run + 3k h; 16 bits, hPa = PRES_MIN + value x PRES_SCALE
+  out/a<run>.png    850 hPa temperature (2026-10-26): the same layout, frame k = AT its hour; 16 bits, deg C =
+                    T850_MIN + value x T850_SCALE
+  out/z<run>.png    500 hPa geopotential height (2026-10-26): the same layout, frame k = AT its hour; 16 bits, m =
+                    Z500_MIN + value x Z500_SCALE, lightly smoothed (Z500_SMOOTH)
   out/latest.json   the run, the grid, frames + step (= 3: the page shows 3-hour periods only - the open data have
                     no hourly steps, and splitting them into hours would be an estimate, not model output), wind {},
-                    temp {}, marks {}
+                    temp {}, marks {}, pres {}, t850 {}, z500 {}; since 2026-10-26 "hours" (each frame's hour from the
+                    run: 0, 3 .. 144, then 150 .. 240 every 6 h - a rain frame past 144 h = the 6 hours ending there)
+                    and for a 06Z / 18Z run "tail" {run, from}: from frame "from" on the frames come from that earlier
+                    00Z / 12Z run (06Z / 18Z end at 144 h; the map says so). Steps are downloaded WORKERS at a time.
 
 usage:
   python ecm9/build.py --check --published published.json   stdlib only: is a newer complete run out? (GitHub output)
@@ -54,10 +61,27 @@ MIRRORS = [                                    # ECMWF's portal, then the AWS co
 BOX = dict(lonW=11.0, lonE=35.0, latS=31.5, latN=47.5)
 RES = 0.1                                      # deg: the open data's own grid, nothing resampled
 STEP = 3                                       # h between the open data's steps (to 144 h)
-HORIZON = 144                                  # h of forecast on the map: all of the open data's 3-hour steps (6 days; was 96 until 2026-10-23)
+HORIZON = 144                                  # h: the last 3-hour step (6 days; was 96 until 2026-10-23); 06Z / 18Z end here
+# 2026-10-26 (user: "go ahead with the 240 h extension; when the data come from a 06 / 18Z run, label that 150-240 come
+# from the previous run"): the 00Z + 12Z runs go on at 6-hour steps (the open data reach 360 h; the map stops at 10 days -
+# a single run's rain areas past ~day 7-10 carry little skill). A 06Z / 18Z run takes its tail from the 00Z / 12Z run
+# before it (TAIL_BACK earlier): the frames past HORIZON then come from that run, and latest.json says so ("tail").
+LONG_RUNS = (0, 12)                            # UTC hours of the runs that go past HORIZON
+LONG_STEP = 6                                  # h between the steps past HORIZON
+LONG_HORIZON = 240                             # h: the map's last step (10 days)
+TAIL_BACK = 6                                  # h: a 06Z / 18Z run's tail = the run this much earlier
 LOOKBACK = 6                                   # runs looked back for the newest complete one (= 36 h)
 TRIES = 4                                      # attempts per file and mirror (waits 3, 6, 9 s between them)
-PARAMS = ("tp", "10u", "10v", "2t", "cp", "mucape", "sf", "msl")   # the messages taken from each step
+WORKERS = 4                                    # steps fetched at once (the downloads were most of the ~10 min build)
+PARAMS = ("tp", "10u", "10v", "2t", "cp", "mucape", "sf", "msl")   # the surface messages taken from each step
+# the upper air (2026-10-26, user: "850 hPa temperature with lines of equal temperature" + "a general 500 hPa geopotential
+# map with pressure lines"): the same step's pressure-level file (-pl); key = param + level
+PL_PARAMS = (("t", "850"), ("gh", "500"))
+T850_SCALE = 0.01                              # deg C per step of the 16-bit 850 hPa temperature (isotherms need a fine field)
+T850_MIN = -60.0                               # deg C of value 0
+Z500_SCALE = 0.05                              # m per step of the 16-bit 500 hPa height
+Z500_MIN = 4500.0                              # m of value 0 (4500 .. 7776 m)
+Z500_SMOOTH = 1.0                              # cells: a light Gaussian on the height (contours without 9 km wiggles)
 PRES_SCALE = 0.01                              # hPa per step of the 16-bit pressure picture (0.05 left terraces in flat fields: broken isobars)
 PRES_MIN = 900.0                               # hPa of value 0
 # sea-level pressure over mountains is a reduction, noisy at 9 km (small closed loops over the Dinarides / Balkan Mts):
@@ -92,10 +116,28 @@ def http(url, rng=None, head=False):
         time.sleep(3 * (t + 1))
 
 
-def stem(run, step):
-    """the folder + file name of a run's surface file at `step` (run = UTC epoch seconds)"""
+def stem(run, step, kind="sfc"):
+    """the folder + file name of a run's surface ("sfc") or pressure-level ("pl") file at `step` (run = UTC epoch s)"""
     d, h = time.strftime("%Y%m%d", time.gmtime(run)), time.gmtime(run).tm_hour
-    return "%s/%02dz/ifs/0p1/oper/%s%02d0000-%dh-oper-fc-sfc" % (d, h, d, h, step)
+    return "%s/%02dz/ifs/0p1/oper/%s%02d0000-%dh-oper-fc-%s" % (d, h, d, h, step, kind)
+
+
+def long_run(run):
+    return time.gmtime(run).tm_hour in LONG_RUNS
+
+
+def plan(run):
+    """the steps to read, in order: (source run, its step, the frame's hour from `run`, or None = only the base the next
+    period's totals start from). 00Z / 12Z: 0..144 every 3 h, then 150..240 every 6 h. 06Z / 18Z: 0..144, then the
+    previous long run - its step at the same instant as run + 144 h as the base, then run + 150 .. + 234 h"""
+    seq = [(run, s, s) for s in range(0, HORIZON + 1, STEP)]
+    if long_run(run):
+        seq += [(run, s, s) for s in range(HORIZON + LONG_STEP, LONG_HORIZON + 1, LONG_STEP)]
+    else:
+        prev = run - TAIL_BACK * 3600
+        seq.append((prev, HORIZON + TAIL_BACK, None))
+        seq += [(prev, s + TAIL_BACK, s) for s in range(HORIZON + LONG_STEP, LONG_HORIZON - TAIL_BACK + 1, LONG_STEP)]
+    return seq
 
 
 def fetch(path, rng=None, head=False):
@@ -112,8 +154,8 @@ def fetch(path, rng=None, head=False):
 
 
 def complete(run):
-    """True when the run's LAST step is out (files arrive in step order)"""
-    return fetch(stem(run, HORIZON) + ".index", head=True) is not None
+    """True when the run's LAST step is out (files arrive in step order; a long run's 6-hour steps come in the same go)"""
+    return fetch(stem(run, LONG_HORIZON if long_run(run) else HORIZON) + ".index", head=True) is not None
 
 
 def newest(published):
@@ -126,22 +168,46 @@ def newest(published):
     return None
 
 
-def messages(run, step):
-    """{param: GRIB message bytes} of one step for PARAMS, via the .index byte ranges"""
-    idx = fetch(stem(run, step) + ".index")
-    if idx is None: raise RuntimeError("no index for +%dh" % step)
+def pick(run, step, kind, want):
+    """{key: GRIB message bytes} from one file via its .index byte ranges; want = {key: (param, level or None)}"""
+    idx = fetch(stem(run, step, kind) + ".index")
+    if idx is None: raise RuntimeError("no %s index for +%dh" % (kind, step))
     lines = {}
     for l in idx.decode().splitlines():
         j = json.loads(l)
-        if j.get("param") in PARAMS: lines[j["param"]] = j
+        for key, (p, lv) in want.items():
+            if j.get("param") == p and (lv is None or j.get("levelist") == lv): lines[key] = j
     out = {}
-    for p in PARAMS:
-        if p not in lines: raise RuntimeError("no %s in the index of +%dh" % (p, step))
-        o, n = lines[p]["_offset"], lines[p]["_length"]
-        msg = fetch(stem(run, step) + ".grib2", (o, o + n - 1))
-        if not msg or len(msg) != n: raise RuntimeError("short %s message at +%dh" % (p, step))
-        out[p] = msg
+    for key in want:
+        if key not in lines: raise RuntimeError("no %s in the %s index of +%dh" % (key, kind, step))
+        o, n = lines[key]["_offset"], lines[key]["_length"]
+        msg = fetch(stem(run, step, kind) + ".grib2", (o, o + n - 1))
+        if not msg or len(msg) != n: raise RuntimeError("short %s message at +%dh" % (key, step))
+        out[key] = msg
     return out
+
+
+def messages(run, step):
+    """{key: GRIB message bytes} of one step: PARAMS from the surface file, PL_PARAMS ("t850", "gh500") from the -pl one"""
+    out = pick(run, step, "sfc", {p: (p, None) for p in PARAMS})
+    out.update(pick(run, step, "pl", {p + lv: (p, lv) for p, lv in PL_PARAMS}))
+    return out
+
+
+def fetched(seq):
+    """messages() of each (run, step, hour) in order, WORKERS steps downloading at once, at most 2 x WORKERS ahead (memory)"""
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(WORKERS) as ex:
+        ahead, it = deque(), iter(seq)
+        for item in it:
+            ahead.append((item, ex.submit(messages, item[0], item[1])))
+            if len(ahead) >= 2 * WORKERS: break
+        while ahead:
+            item, fu = ahead.popleft()
+            nxt = next(it, None)
+            if nxt is not None: ahead.append((nxt, ex.submit(messages, nxt[0], nxt[1])))
+            yield item, fu.result()
 
 
 def build(run, out):
@@ -166,29 +232,39 @@ def build(run, out):
             cut["r"], cut["c"] = np.rint((la1 - la) / d).astype(int), np.rint(((lo - lo1) % 360) / d).astype(int)
         return v[np.ix_(cut["r"], cut["c"])]
 
-    prev, rain, us, vs, ts, ps, got = None, [], [], [], [], [], 0
+    prev, rain, us, vs, ts, ps, a8, z5, got = None, [], [], [], [], [], [], [], 0
     pcp = psf = pcape = None; thunder, snow = [], []
-    for step in range(0, HORIZON + 1, STEP):
-        m = messages(run, step); got += sum(len(x) for x in m.values())
-        cur = decode(m["tp"])                  # m accumulated since the run's start
-        tp3 = np.zeros_like(cur) if prev is None else np.clip(cur - prev, 0, None) * 1000.0
-        rain.append(tp3)
+    hours, tail_from, last_h = [], None, 0
+    for (srun, step, hour), m in fetched(plan(run)):
+        got += sum(len(x) for x in m.values())
+        cur = decode(m["tp"])                  # m accumulated since the SOURCE run's start
+        ccp, csf, cape = decode(m["cp"]), decode(m["sf"]), np.nan_to_num(decode(m["mucape"]))
+        if hour is None:                       # the tail's base: only where its first period's totals start from
+            prev, pcp, psf, pcape = cur, ccp, csf, cape
+            continue
+        if srun != run and tail_from is None: tail_from = len(hours)
+        per = hour - last_h if hours else STEP # this frame's period, h (3, past HORIZON 6)
+        tp = np.zeros_like(cur) if prev is None else np.clip(cur - prev, 0, None) * 1000.0
+        rain.append(tp)
         prev = cur
         us.append(decode(m["10u"])); vs.append(decode(m["10v"])); ts.append(decode(m["2t"]) - 273.15)
         ps.append(decode(m["msl"]) / 100.0)    # Pa -> hPa
-        # the marks: this period's convective rain + snowfall (accumulated, m) and the larger CAPE of its two ends
-        ccp, csf, cape = decode(m["cp"]), decode(m["sf"]), np.nan_to_num(decode(m["mucape"]))
+        a8.append(decode(m["t850"]) - 273.15); z5.append(decode(m["gh500"]))
+        # the marks: this period's convective rain + snowfall (accumulated, m) and the larger CAPE of its two ends; the
+        # thresholds are per 3 hours, so a 6-hour period's totals count at their 3-hour rate (x STEP / per)
         lvl = np.zeros(cur.shape, np.uint8); share = np.zeros(cur.shape, np.uint8)
         if pcp is not None:
-            cp3, sf3, cmax = np.clip(ccp - pcp, 0, None) * 1000.0, np.clip(csf - psf, 0, None) * 1000.0, np.maximum(cape, pcape)
+            rate = STEP / float(per)
+            cp3, sf3, cmax = np.clip(ccp - pcp, 0, None) * 1000.0 * rate, np.clip(csf - psf, 0, None) * 1000.0, np.maximum(cape, pcape)
             on = (cp3 >= THUNDER_MIN[0]) & (cmax >= THUNDER_MIN[1])
             idx = cp3[on] * np.sqrt(cmax[on])
             f = np.log(np.maximum(idx, THUNDER_SPAN[0]) / THUNDER_SPAN[0]) / np.log(THUNDER_SPAN[1] / THUNDER_SPAN[0])
             lvl[on] = (1 + np.rint(np.clip(f, 0, 1) * 254)).astype(np.uint8)
-            wet = tp3 >= SNOW_MIN_MM
-            share[wet] = np.rint(np.clip(sf3[wet] / tp3[wet], 0, 1) * 255).astype(np.uint8)
+            wet = tp * rate >= SNOW_MIN_MM
+            share[wet] = np.rint(np.clip(sf3[wet] / tp[wet], 0, 1) * 255).astype(np.uint8)
         thunder.append(lvl); snow.append(share)
         pcp, psf, pcape = ccp, csf, cape
+        hours.append(hour); last_h = hour
 
     ny, nx = rain[0].shape
     os.makedirs(out, exist_ok=True)
@@ -224,12 +300,23 @@ def build(run, out):
     xname = "x%d.png" % run
     Image.fromarray(img, "RGB").save(os.path.join(out, xname), optimize=True)
 
+    aname = "a%d.png" % run                    # 850 hPa temperature
+    save16([(t - T850_MIN) / T850_SCALE for t in a8], aname)
+    zname = "z%d.png" % run                    # 500 hPa height, lightly smoothed
+    z5 = [smooth(z, Z500_SMOOTH) for z in z5]
+    save16([(z - Z500_MIN) / Z500_SCALE for z in z5], zname)
+
+    # "hours" = each frame's hour from the run (3-hourly to HORIZON, then 6-hourly); "tail" (06Z / 18Z) = from frame
+    # "from" on, the frames come from the run "run" (TAIL_BACK earlier). "step" stays the base step for older pages
     meta = dict(model="ecmwf_ifs_open_0p1", run=run, generated=int(time.time()), file=name, nx=nx, ny=ny,
-                frames=len(rain), step=STEP, lonW=BOX["lonW"], latN=BOX["latN"], dx=RES, dy=RES, scale=0.01, fill=FILL,
+                frames=len(rain), step=STEP, hours=hours, lonW=BOX["lonW"], latN=BOX["latN"], dx=RES, dy=RES, scale=0.01, fill=FILL,
                 wind=dict(file=wname, scale=WIND_SCALE, zero=WIND_ZERO),
                 temp=dict(file=tname, scale=TEMP_SCALE, offset=TEMP_MIN), marks=dict(file=xname, v=2),
                 pres=dict(file=mname, scale=PRES_SCALE, offset=PRES_MIN),
+                t850=dict(file=aname, scale=T850_SCALE, offset=T850_MIN),
+                z500=dict(file=zname, scale=Z500_SCALE, offset=Z500_MIN),
                 source="ECMWF open data (CC BY 4.0)")
+    if tail_from is not None: meta["tail"] = {"run": run - TAIL_BACK * 3600, "from": tail_from}
     with open(os.path.join(out, "latest.json"), "w") as f: json.dump(meta, f)
     spd = np.hypot(np.stack(us), np.stack(vs)) * 3.6
     kb = lambda n: os.path.getsize(os.path.join(out, n)) / 1024
@@ -240,6 +327,9 @@ def build(run, out):
           kb(wname), float(spd.max()), kb(tname), float(np.min(ts)), float(np.max(ts)), kb(xname),
           int((th > 0).sum()), *(int(np.percentile(th[th > 0], q)) if (th > 0).any() else 0 for q in (50, 90, 100)), int((sn >= 128).sum())))
     print("pressure png %.1f KB (%.1f..%.1f hPa)" % (kb(mname), float(np.min(ps)), float(np.max(ps))))
+    print("850 hPa temp png %.1f KB (%.1f..%.1f C), 500 hPa height png %.1f KB (%.0f..%.0f m); hours %s; tail %s" % (
+          kb(aname), float(np.min(a8)), float(np.max(a8)), kb(zname), float(np.min(z5)), float(np.max(z5)),
+          ",".join(str(h) for h in hours), meta.get("tail")))
 
 
 def output(**kv):

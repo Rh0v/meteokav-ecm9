@@ -39,12 +39,17 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 2026-10-26: to 240 h (00Z / 12Z) + the upper air - ~65 steps of two files each, WORKERS downloads at once
+    timeout-minutes: 45
+    env:
+      # the main branch publishes to "data" (what the site pulls); any other branch to its own "data-<branch>" - a
+      # format change is built + checked there before main gets it
+      DATA_BRANCH: ${{ github.ref_name == 'main' && 'data' || format('data-{0}', github.ref_name) }}
     steps:
       - uses: actions/checkout@v7
 
       - name: Published run
-        run: git fetch --depth=1 origin data:data 2>/dev/null && git show data:latest.json > published.json || echo '{}' > published.json
+        run: git fetch --depth=1 origin "$DATA_BRANCH:$DATA_BRANCH" 2>/dev/null && git show "$DATA_BRANCH:latest.json" > published.json || echo '{}' > published.json
 
       - name: Newer run out?
         id: check
@@ -73,4 +78,4 @@ jobs:
           cp out/latest.json out/*.png .
           git add latest.json *.png
           git commit -q -m "run ${{ steps.check.outputs.run }}"
-          git push -f origin HEAD:data
+          git push -f origin "HEAD:$DATA_BRANCH"
