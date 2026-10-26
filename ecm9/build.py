@@ -34,6 +34,9 @@ through the step's .index file (byte ranges: ~14 MB of a ~90 MB file, ~450 MB a 
                     T850_MIN + value x T850_SCALE
   out/z<run>.png    500 hPa geopotential height (2026-10-26): the same layout, frame k = AT its hour; 16 bits, m =
                     Z500_MIN + value x Z500_SCALE, lightly smoothed (Z500_SMOOTH)
+  out/g<run>.png    10 m gusts (2026-10-26): the same layout, frame k = the strongest gust of the window ENDING at its
+                    hour (latest.json gust.win[k] h: 1 to +90 h, 3 to +144 h, 6 past - see GUST); 16 bits, m/s = value x
+                    GUST_SCALE; frame 0 = the analysis' (not shown)
   out/latest.json   the run, the grid, frames + step (= 3: the page shows 3-hour periods only - the open data have
                     no hourly steps, and splitting them into hours would be an estimate, not model output), wind {},
                     temp {}, marks {}, pres {}, t850 {}, z500 {}; since 2026-10-26 "hours" (each frame's hour from the
@@ -85,6 +88,12 @@ T850_SMOOTH = 1.5                              # cells: a Gaussian on it (at 850
 Z500_SCALE = 0.5                               # m per step of the 16-bit 500 hPa height (contours every 40 m; 0.05 = a 1.8 MB picture)
 Z500_MIN = 4500.0                              # m of value 0
 Z500_SMOOTH = 1.0                              # cells: a light Gaussian on the height (contours without 9 km wiggles)
+# 10 m GUSTS (2026-10-26, user: "a gust layer as a sub option of the wind layer"): the open data's gust is a period maximum
+# whose period changes along the run - "10fg" to +90 h = the strongest gust of the LAST HOUR (IFS post-processes hourly
+# there; the open data keep every third), "10fg3" +93..+144 h = of the last 3 hours, "10fg" past +144 h = of the last 6
+# hours. Each frame's window (h) goes into latest.json "gust" "win", the page labels it so
+GUST = ("10fg3", "10fg")                       # the step's gust message: the 3-hour one where it exists
+GUST_SCALE = 0.1                               # m/s per step of the 16-bit gust picture
 PRES_SCALE = 0.01                              # hPa per step of the 16-bit pressure picture (0.05 left terraces in flat fields: broken isobars)
 PRES_MIN = 900.0                               # hPa of value 0
 # sea-level pressure over mountains is a reduction, noisy at 9 km (small closed loops over the Dinarides / Balkan Mts):
@@ -172,14 +181,19 @@ def newest(published):
 
 
 def pick(run, step, kind, want):
-    """{key: GRIB message bytes} from one file via its .index byte ranges; want = {key: (param, level or None)}"""
+    """{key: GRIB message bytes} from one file via its .index byte ranges; want = {key: (param, level or None)} or
+    {key: [(param, level), ...]} = alternatives, the first one the index has wins (its param: out[key + ":param"])"""
     idx = fetch(stem(run, step, kind) + ".index")
     if idx is None: raise RuntimeError("no %s index for +%dh" % (kind, step))
+    alts = {key: (w if isinstance(w, list) else [w]) for key, w in want.items()}
     lines = {}
     for l in idx.decode().splitlines():
         j = json.loads(l)
-        for key, (p, lv) in want.items():
-            if j.get("param") == p and (lv is None or j.get("levelist") == lv): lines[key] = j
+        for key, opts in alts.items():
+            for rank, (p, lv) in enumerate(opts):
+                if j.get("param") == p and (lv is None or j.get("levelist") == lv) and rank < lines.get(key, (99, None))[0]:
+                    lines[key] = (rank, j)
+    lines = {key: j for key, (rank, j) in lines.items()}
     out = {}
     for key in want:
         if key not in lines: raise RuntimeError("no %s in the %s index of +%dh" % (key, kind, step))
@@ -187,12 +201,15 @@ def pick(run, step, kind, want):
         msg = fetch(stem(run, step, kind) + ".grib2", (o, o + n - 1))
         if not msg or len(msg) != n: raise RuntimeError("short %s message at +%dh" % (key, step))
         out[key] = msg
+        out[key + ":param"] = lines[key]["param"]
     return out
 
 
 def messages(run, step):
     """{key: GRIB message bytes} of one step: PARAMS from the surface file, PL_PARAMS ("t850", "gh500") from the -pl one"""
-    out = pick(run, step, "sfc", {p: (p, None) for p in PARAMS})
+    want = {p: (p, None) for p in PARAMS}
+    want["gust"] = [(g, None) for g in GUST]
+    out = pick(run, step, "sfc", want)
     out.update(pick(run, step, "pl", {p + lv: (p, lv) for p, lv in PL_PARAMS}))
     return out
 
@@ -235,11 +252,11 @@ def build(run, out):
             cut["r"], cut["c"] = np.rint((la1 - la) / d).astype(int), np.rint(((lo - lo1) % 360) / d).astype(int)
         return v[np.ix_(cut["r"], cut["c"])]
 
-    prev, rain, us, vs, ts, ps, a8, z5, got = None, [], [], [], [], [], [], [], 0
+    prev, rain, us, vs, ts, ps, a8, z5, gs, gw, got = None, [], [], [], [], [], [], [], [], [], 0
     pcp = psf = pcape = None; thunder, snow = [], []
     hours, tail_from, last_h = [], None, 0
     for (srun, step, hour), m in fetched(plan(run)):
-        got += sum(len(x) for x in m.values())
+        got += sum(len(x) for x in m.values() if isinstance(x, bytes))
         cur = decode(m["tp"])                  # m accumulated since the SOURCE run's start
         ccp, csf, cape = decode(m["cp"]), decode(m["sf"]), np.nan_to_num(decode(m["mucape"]))
         if hour is None:                       # the tail's base: only where its first period's totals start from
@@ -253,6 +270,8 @@ def build(run, out):
         us.append(decode(m["10u"])); vs.append(decode(m["10v"])); ts.append(decode(m["2t"]) - 273.15)
         ps.append(decode(m["msl"]) / 100.0)    # Pa -> hPa
         a8.append(decode(m["t850"]) - 273.15); z5.append(decode(m["gh500"]))
+        gs.append(np.nan_to_num(decode(m["gust"])))
+        gw.append(3 if m["gust:param"] == "10fg3" else LONG_STEP if step > HORIZON else 1)   # its window, h (see GUST)
         # the marks: this period's convective rain + snowfall (accumulated, m) and the larger CAPE of its two ends; the
         # thresholds are per 3 hours, so a 6-hour period's totals count at their 3-hour rate (x STEP / per)
         lvl = np.zeros(cur.shape, np.uint8); share = np.zeros(cur.shape, np.uint8)
@@ -306,6 +325,8 @@ def build(run, out):
     aname = "a%d.png" % run                    # 850 hPa temperature
     a8 = [smooth(t, T850_SMOOTH) for t in a8]
     save16([(t - T850_MIN) / T850_SCALE for t in a8], aname)
+    gname = "g%d.png" % run                    # 10 m gusts (m/s, each frame's own window)
+    save16([g / GUST_SCALE for g in gs], gname)
     zname = "z%d.png" % run                    # 500 hPa height, lightly smoothed
     z5 = [smooth(z, Z500_SMOOTH) for z in z5]
     save16([(z - Z500_MIN) / Z500_SCALE for z in z5], zname)
@@ -319,6 +340,7 @@ def build(run, out):
                 pres=dict(file=mname, scale=PRES_SCALE, offset=PRES_MIN),
                 t850=dict(file=aname, scale=T850_SCALE, offset=T850_MIN),
                 z500=dict(file=zname, scale=Z500_SCALE, offset=Z500_MIN),
+                gust=dict(file=gname, scale=GUST_SCALE, offset=0, win=gw),
                 source="ECMWF open data (CC BY 4.0)")
     if tail_from is not None: meta["tail"] = {"run": run - TAIL_BACK * 3600, "from": tail_from}
     with open(os.path.join(out, "latest.json"), "w") as f: json.dump(meta, f)
@@ -331,6 +353,7 @@ def build(run, out):
           kb(wname), float(spd.max()), kb(tname), float(np.min(ts)), float(np.max(ts)), kb(xname),
           int((th > 0).sum()), *(int(np.percentile(th[th > 0], q)) if (th > 0).any() else 0 for q in (50, 90, 100)), int((sn >= 128).sum())))
     print("pressure png %.1f KB (%.1f..%.1f hPa)" % (kb(mname), float(np.min(ps)), float(np.max(ps))))
+    print("gust png %.1f KB (max %.0f km/h; windows %s)" % (kb(gname), float(np.max(gs)) * 3.6, ",".join(str(w) for w in gw)))
     print("850 hPa temp png %.1f KB (%.1f..%.1f C), 500 hPa height png %.1f KB (%.0f..%.0f m); hours %s; tail %s" % (
           kb(aname), float(np.min(a8)), float(np.max(a8)), kb(zname), float(np.min(z5)), float(np.max(z5)),
           ",".join(str(h) for h in hours), meta.get("tail")))
