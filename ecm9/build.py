@@ -77,7 +77,8 @@ PARAMS = ("tp", "10u", "10v", "2t", "cp", "mucape", "sf", "msl")   # the surface
 # the upper air (2026-10-26, user: "850 hPa temperature with lines of equal temperature" + "a general 500 hPa geopotential
 # map with pressure lines"): the same step's pressure-level file (-pl); key = param + level
 PL_PARAMS = (("t", "850"), ("gh", "500"))
-T850_SCALE = 0.01                              # deg C per step of the 16-bit 850 hPa temperature (isotherms need a fine field)
+T850_SCALE = 0.02                              # deg C per step of the 16-bit 850 hPa temperature (lines every 2 deg C: 1/100 of a
+                                               # spacing, as the isobars; 0.01 after the smoothing = a 1.8 MB picture)
 T850_MIN = -60.0                               # deg C of value 0
 T850_SMOOTH = 1.5                              # cells: a Gaussian on it (at 850 hPa over the mountains the level meets the
                                                # ground - raw isotherms zig-zag there; every 850 hPa chart is smoothed)
