@@ -34,6 +34,8 @@ through the step's .index file (byte ranges: ~14 MB of a ~90 MB file, ~450 MB a 
                     T850_MIN + value x T850_SCALE
   out/z<run>.png    500 hPa geopotential height (2026-10-26): the same layout, frame k = AT its hour; 16 bits, m =
                     Z500_MIN + value x Z500_SCALE, lightly smoothed (Z500_SMOOTH)
+  out/ea|ez|em<run>.png  EUROPE (2026-10-26, see EU): 850 hPa temperature, 500 hPa height, sea-level pressure on the
+                    EU_RES grid, same frames and encodings as a / z / m; latest.json "eu" {nx, ny, lonW, latN, dx, dy, ...}
   out/g<run>.png    10 m gusts (2026-10-26): the same layout, frame k = the strongest gust of the window ENDING at its
                     hour (latest.json gust.win[k] h: 1 to +90 h, 3 to +144 h, 6 past - see GUST); 16 bits, m/s = value x
                     GUST_SCALE; frame 0 = the analysis' (not shown)
@@ -93,6 +95,13 @@ Z500_SMOOTH = 1.0                              # cells: a light Gaussian on the 
 # there; the open data keep every third), "10fg3" +93..+144 h = of the last 3 hours, "10fg" past +144 h = of the last 6
 # hours. Each frame's window (h) goes into latest.json "gust" "win", the page labels it so
 GUST = ("10fg3", "10fg")                       # the step's gust message: the 3-hour one where it exists
+# EUROPE (2026-10-26, user: "a Europe-scale map for 850 hPa and 500 hPa geopotential / pressure - 0.25 deg, no particles"):
+# the same global messages, a second, larger cut - Iceland / Iberia to the edge of the Urals, North Africa to Scandinavia -
+# at EU_RES: smoothed on the 0.1 grid first (each field's own Gaussian, at least EU_AA cells: no aliasing), then sampled
+# bilinearly. -> ea / ez / em<run>.png (850 hPa temperature, 500 hPa height, sea-level pressure) + latest.json "eu"
+EU = dict(lonW=-25.0, lonE=45.0, latS=30.0, latN=72.0)
+EU_RES = 0.25                                  # deg
+EU_AA = 1.5                                    # cells of 0.1 deg: the least smoothing before the 0.25 deg sampling
 GUST_SCALE = 0.1                               # m/s per step of the 16-bit gust picture
 PRES_SCALE = 0.01                              # hPa per step of the 16-bit pressure picture (0.05 left terraces in flat fields: broken isobars)
 PRES_MIN = 900.0                               # hPa of value 0
@@ -236,7 +245,23 @@ def build(run, out):
 
     cut = {}                                   # the box's rows + columns in the global grid (found once)
 
-    def decode(msg):
+    def smooth(a, sigma):                      # separable Gaussian, edges padded (no numpy-free scipy needed)
+        r = int(3 * sigma); k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2); k /= k.sum()
+        p = np.pad(a, r, mode="edge")
+        p = np.apply_along_axis(lambda v: np.convolve(v, k, "valid"), 1, p)
+        return np.apply_along_axis(lambda v: np.convolve(v, k, "valid"), 0, p)
+
+    elat = np.round(np.arange(EU["latN"], EU["latS"] - 1e-6, -EU_RES), 4)
+    elon = np.round(np.arange(EU["lonW"], EU["lonE"] + 1e-6, EU_RES), 4)
+    def europe(fine, sigma):                   # the 0.1 deg Europe cut -> smoothed -> sampled at EU_RES (bilinear)
+        a = smooth(fine, max(sigma, EU_AA))
+        fr, fc = (EU["latN"] - elat) / RES, (elon - EU["lonW"]) / RES
+        r0 = np.clip(np.floor(fr).astype(int), 0, a.shape[0] - 2); c0 = np.clip(np.floor(fc).astype(int), 0, a.shape[1] - 2)
+        wr, wc = (fr - r0)[:, None], (fc - c0)[None, :]
+        R, C = np.ix_(r0, c0)
+        return (a[R, C] * (1 - wr) * (1 - wc) + a[R, C + 1] * (1 - wr) * wc + a[R + 1, C] * wr * (1 - wc) + a[R + 1, C + 1] * wr * wc)
+
+    def decode(msg, eu=False):
         h = eccodes.codes_new_from_message(msg)
         try:
             ni, nj = eccodes.codes_get(h, "Ni"), eccodes.codes_get(h, "Nj")
@@ -250,9 +275,14 @@ def build(run, out):
             la = np.round(np.arange(BOX["latN"], BOX["latS"] - 1e-6, -RES), 4)
             lo = np.round(np.arange(BOX["lonW"], BOX["lonE"] + 1e-6, RES), 4)
             cut["r"], cut["c"] = np.rint((la1 - la) / d).astype(int), np.rint(((lo - lo1) % 360) / d).astype(int)
-        return v[np.ix_(cut["r"], cut["c"])]
+            la = np.round(np.arange(EU["latN"], EU["latS"] - 1e-6, -RES), 4)
+            lo = np.round(np.arange(EU["lonW"], EU["lonE"] + 1e-6, RES), 4)
+            cut["er"], cut["ec"] = np.rint((la1 - la) / d).astype(int), np.rint(((lo - lo1) % 360) / d).astype(int)
+        box = v[np.ix_(cut["r"], cut["c"])]
+        return (box, v[np.ix_(cut["er"], cut["ec"])]) if eu else box
 
     prev, rain, us, vs, ts, ps, a8, z5, gs, gw, got = None, [], [], [], [], [], [], [], [], [], 0
+    ep, ea, ez = [], [], []                    # Europe: pressure, 850 hPa temperature, 500 hPa height (at EU_RES)
     pcp = psf = pcape = None; thunder, snow = [], []
     hours, tail_from, last_h = [], None, 0
     for (srun, step, hour), m in fetched(plan(run)):
@@ -268,8 +298,9 @@ def build(run, out):
         rain.append(tp)
         prev = cur
         us.append(decode(m["10u"])); vs.append(decode(m["10v"])); ts.append(decode(m["2t"]) - 273.15)
-        ps.append(decode(m["msl"]) / 100.0)    # Pa -> hPa
-        a8.append(decode(m["t850"]) - 273.15); z5.append(decode(m["gh500"]))
+        b, e = decode(m["msl"], True); ps.append(b / 100.0); ep.append(europe(e / 100.0, PRES_SMOOTH))   # Pa -> hPa
+        b, e = decode(m["t850"], True); a8.append(b - 273.15); ea.append(europe(e - 273.15, T850_SMOOTH))
+        b, e = decode(m["gh500"], True); z5.append(b); ez.append(europe(e, Z500_SMOOTH))
         gs.append(np.nan_to_num(decode(m["gust"])))
         gw.append(3 if m["gust:param"] == "10fg3" else LONG_STEP if step > HORIZON else 1)   # its window, h (see GUST)
         # the marks: this period's convective rain + snowfall (accumulated, m) and the larger CAPE of its two ends; the
@@ -291,9 +322,10 @@ def build(run, out):
     ny, nx = rain[0].shape
     os.makedirs(out, exist_ok=True)
 
-    def save16(frames, name):                  # 16 bits per cell: R = high byte, G = low byte
-        q = np.clip(np.rint(np.stack(frames)), 0, FILL - 1).astype(np.uint16).reshape(len(frames) * ny, nx)
-        img = np.zeros((len(frames) * ny, nx, 3), np.uint8)
+    def save16(frames, name):                  # 16 bits per cell: R = high byte, G = low byte (any grid: its own size)
+        fy, fx = frames[0].shape
+        q = np.clip(np.rint(np.stack(frames)), 0, FILL - 1).astype(np.uint16).reshape(len(frames) * fy, fx)
+        img = np.zeros((len(frames) * fy, fx, 3), np.uint8)
         img[..., 0], img[..., 1] = q >> 8, q & 255
         Image.fromarray(img, "RGB").save(os.path.join(out, name), optimize=True)
 
@@ -301,12 +333,6 @@ def build(run, out):
     save16([r * 100 for r in rain], name)
     tname = "t%d.png" % run
     save16([(t - TEMP_MIN) / TEMP_SCALE for t in ts], tname)
-    def smooth(a, sigma):                      # separable Gaussian, edges padded (no numpy-free scipy needed)
-        r = int(3 * sigma); k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2); k /= k.sum()
-        p = np.pad(a, r, mode="edge")
-        p = np.apply_along_axis(lambda v: np.convolve(v, k, "valid"), 1, p)
-        return np.apply_along_axis(lambda v: np.convolve(v, k, "valid"), 0, p)
-
     ps = [smooth(p, PRES_SMOOTH) for p in ps]
     mname = "m%d.png" % run
     save16([(p - PRES_MIN) / PRES_SCALE for p in ps], mname)
@@ -343,6 +369,15 @@ def build(run, out):
                 gust=dict(file=gname, scale=GUST_SCALE, offset=0, win=gw),
                 source="ECMWF open data (CC BY 4.0)")
     if tail_from is not None: meta["tail"] = {"run": run - TAIL_BACK * 3600, "from": tail_from}
+    # Europe: its own grid, the same frames / hours
+    eaname, ezname, emname = "ea%d.png" % run, "ez%d.png" % run, "em%d.png" % run
+    save16([(t - T850_MIN) / T850_SCALE for t in ea], eaname)
+    save16([(z - Z500_MIN) / Z500_SCALE for z in ez], ezname)
+    save16([(p - PRES_MIN) / PRES_SCALE for p in ep], emname)
+    meta["eu"] = dict(nx=len(elon), ny=len(elat), lonW=EU["lonW"], latN=EU["latN"], dx=EU_RES, dy=EU_RES,
+                      t850=dict(file=eaname, scale=T850_SCALE, offset=T850_MIN),
+                      z500=dict(file=ezname, scale=Z500_SCALE, offset=Z500_MIN),
+                      pres=dict(file=emname, scale=PRES_SCALE, offset=PRES_MIN))
     with open(os.path.join(out, "latest.json"), "w") as f: json.dump(meta, f)
     spd = np.hypot(np.stack(us), np.stack(vs)) * 3.6
     kb = lambda n: os.path.getsize(os.path.join(out, n)) / 1024
@@ -353,6 +388,8 @@ def build(run, out):
           kb(wname), float(spd.max()), kb(tname), float(np.min(ts)), float(np.max(ts)), kb(xname),
           int((th > 0).sum()), *(int(np.percentile(th[th > 0], q)) if (th > 0).any() else 0 for q in (50, 90, 100)), int((sn >= 128).sum())))
     print("pressure png %.1f KB (%.1f..%.1f hPa)" % (kb(mname), float(np.min(ps)), float(np.max(ps))))
+    print("Europe %d x %d: 850 hPa png %.1f KB, 500 hPa png %.1f KB, pressure png %.1f KB (%.1f..%.1f hPa)" % (
+          len(elon), len(elat), kb(eaname), kb(ezname), kb(emname), float(np.min(ep)), float(np.max(ep))))
     print("gust png %.1f KB (max %.0f km/h; windows %s)" % (kb(gname), float(np.max(gs)) * 3.6, ",".join(str(w) for w in gw)))
     print("850 hPa temp png %.1f KB (%.1f..%.1f C), 500 hPa height png %.1f KB (%.0f..%.0f m); hours %s; tail %s" % (
           kb(aname), float(np.min(a8)), float(np.max(a8)), kb(zname), float(np.min(z5)), float(np.max(z5)),
