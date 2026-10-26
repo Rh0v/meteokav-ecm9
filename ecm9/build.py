@@ -79,8 +79,10 @@ PARAMS = ("tp", "10u", "10v", "2t", "cp", "mucape", "sf", "msl")   # the surface
 PL_PARAMS = (("t", "850"), ("gh", "500"))
 T850_SCALE = 0.01                              # deg C per step of the 16-bit 850 hPa temperature (isotherms need a fine field)
 T850_MIN = -60.0                               # deg C of value 0
-Z500_SCALE = 0.05                              # m per step of the 16-bit 500 hPa height
-Z500_MIN = 4500.0                              # m of value 0 (4500 .. 7776 m)
+T850_SMOOTH = 1.5                              # cells: a Gaussian on it (at 850 hPa over the mountains the level meets the
+                                               # ground - raw isotherms zig-zag there; every 850 hPa chart is smoothed)
+Z500_SCALE = 0.5                               # m per step of the 16-bit 500 hPa height (contours every 40 m; 0.05 = a 1.8 MB picture)
+Z500_MIN = 4500.0                              # m of value 0
 Z500_SMOOTH = 1.0                              # cells: a light Gaussian on the height (contours without 9 km wiggles)
 PRES_SCALE = 0.01                              # hPa per step of the 16-bit pressure picture (0.05 left terraces in flat fields: broken isobars)
 PRES_MIN = 900.0                               # hPa of value 0
@@ -301,6 +303,7 @@ def build(run, out):
     Image.fromarray(img, "RGB").save(os.path.join(out, xname), optimize=True)
 
     aname = "a%d.png" % run                    # 850 hPa temperature
+    a8 = [smooth(t, T850_SMOOTH) for t in a8]
     save16([(t - T850_MIN) / T850_SCALE for t in a8], aname)
     zname = "z%d.png" % run                    # 500 hPa height, lightly smoothed
     z5 = [smooth(z, Z500_SMOOTH) for z in z5]
